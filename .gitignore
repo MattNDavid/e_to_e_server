@@ -1,0 +1,35 @@
+# Rust build and dependency files
+/target/
+**/*.rs.bk
+
+# VS Code settings
+.vscode/
+*.code-workspace
+
+# Cargo files
+Cargo.lock
+.cargo/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Windows-specific
+*.exe
+*.dll
+*.pdb
+
+# Backup files
+*~
+*.bak
+
+# Ignore user secrets and credentials
+users.csv
+.env
+
+# Ignore generated type files from error messages
+*.long-type-*.txt
