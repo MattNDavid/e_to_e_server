@@ -1,6 +1,8 @@
 use tokio_postgres::{Client};
 mod connect_to_db;
 mod server;
+mod websocket_helpers;
+mod messages_outbound;
 
 #[tokio::main]
 async fn main() {

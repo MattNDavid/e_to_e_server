@@ -16,6 +16,8 @@ use password_hash::{SaltString};
 use base64::engine::Engine; // Import the Engine trait for encode()
 
 use crate::connect_to_db::db_connection;
+use crate::websocket_helpers;
+use crate::messages_outbound;
 
 type Users = Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>;
 
@@ -40,25 +42,14 @@ async fn websocket_handler(
     axum::extract::State(users): axum::extract::State<Users>,
 ) -> impl IntoResponse {
     
-    // Extract authentication headers
-    let user_id = headers.get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let token = headers.get("x-auth-token")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let uuid = headers.get("x-device-uuid")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let device_id = headers.get("x-device-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
-
+    let parsed_headers = websocket_helpers::extract_auth_headers(headers)
+        .await;
     //If client does not provide required headers, return HTTP400
-    if user_id.is_none() || token.is_none() || uuid.is_none() || device_id.is_none() {
+    if let Err(_) = parsed_headers {
         return Err(StatusCode::BAD_REQUEST);
     }
+
+    let (user_id, token, uuid, device_id) = parsed_headers.unwrap();
 
     //Connect to the database
     let client = db_connection().await;
@@ -69,23 +60,20 @@ async fn websocket_handler(
     // Query for device uuid and token (both used for auth)
     let query = "SELECT uuid, current_token FROM devices WHERE user_id = $1 AND device_id = $2";
     let result = client.query(query, &[&user_id, &device_id.as_ref().unwrap().parse::<i32>().unwrap()]).await;
-    println!("Query result: {:?}", result);
+
     let rows = match result {
         Ok(ref rows) if !rows.is_empty() => rows,
         Ok(_) | Err(_) => return Err(StatusCode::UNAUTHORIZED),
     };
+    //extract the uuid and token from the output
     let row = &rows[0];
-
     let db_uuid = row.get::<_, String>(0);
     let db_token = row.get::<_, String>(1);
-    println!("DB UUID: {}, DB Token: {}", db_uuid, db_token);
-
 
     //uuid is hashed in the database, so verify with argon2
     let argon2 = Argon2::default();
     let parsed_uuid = password_hash::PasswordHash::new(&db_uuid)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    println!("Parsed UUID: {:?}", parsed_uuid);
     if argon2.verify_password(uuid.unwrap().as_bytes(), &parsed_uuid).is_err() || token.unwrap() != db_token {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -94,13 +82,10 @@ async fn websocket_handler(
     // This is to prevent replay attacks and ensure the token is fresh
     let new_token = generate_token().await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    println!("New token generated: {}", new_token);
+
     let _query = client.execute("UPDATE devices SET current_token = $1 WHERE user_id = $2 AND device_id = $3", &[&new_token, &user_id, &device_id.as_ref().unwrap().parse::<i32>().unwrap()])
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    println!("Device token updated in database");
-    let user_id = user_id.unwrap();
-    let device_id = device_id.unwrap();
 
     Ok(ws.on_upgrade(move |socket| handle_socket(socket, users, user_id, device_id, new_token)))
 }
@@ -112,13 +97,7 @@ async fn handle_socket(socket: WebSocket, users: Users, user_id: String, device_
     let (tx, mut rx) = broadcast::channel::<String>(100);
 
     //send a confirmation message to the confirm successful connection
-    let confirmation_message = serde_json::json!({
-        "type": "confirmation",
-        "message": format!("User {} connected successfully", user_id),
-        "token": new_token,
-        "timestamp": chrono::Utc::now().timestamp()
-    });
-
+    let confirmation_message = messages_outbound::confirmation(&user_id, &new_token).await?;
     tx.send(confirmation_message.to_string()).unwrap();
 
     //insert the user into the users map
@@ -159,13 +138,7 @@ async fn handle_socket(socket: WebSocket, users: Users, user_id: String, device_
                                         let users_lock = users_clone.lock().await;
                                         // Check if recipient exists in the users map
                                         if let Some(recipient_tx) = users_lock.get(recipient) {
-
-                                            let message = serde_json::json!({
-                                                "type": "message",
-                                                "from": user_id_clone,
-                                                "content": content,
-                                                "timestamp": chrono::Utc::now().timestamp()
-                                            });
+                                            let message = messages_outbound::message(&user_id_clone, content).await?;
                                             let _ = recipient_tx.send(message.to_string());
                                         }
                                     }
@@ -273,6 +246,7 @@ async fn new_account_logic(data: Value) -> Result<Value, StatusCode> {
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
+
     if _result.is_empty() {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
