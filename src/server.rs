@@ -1,12 +1,11 @@
 use axum::{
-    extract::{Query, Json, WebSocketUpgrade, ws::WebSocket},
+    extract::{Json, WebSocketUpgrade, ws::WebSocket},
     http::{StatusCode, HeaderMap},
     response::{Json as ResponseJson, IntoResponse},
     routing::{get, post},
     Router,
 };
 use serde_json::Value;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
@@ -15,11 +14,15 @@ use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use password_hash::{SaltString};
 use base64::engine::Engine; // Import the Engine trait for encode()
 
-use crate::connect_to_db::db_connection;
+use crate::db::db_connection;
+use crate::authentication;
+use crate::account_creation;
 use crate::websocket_helpers;
 use crate::messages_outbound;
+use crate::messages_inbound;
 
-type Users = Arc<Mutex<HashMap<String, broadcast::Sender<String>>>>;
+//hashmap to contain device ids and broadcast channels
+type Users = Arc<Mutex<HashMap<i32, broadcast::Sender<String>>>>;
 
 pub async fn app() -> tokio::io::Result<()> {
     let users: Users = Arc::new(Mutex::new(HashMap::new()));
@@ -59,7 +62,7 @@ async fn websocket_handler(
     let client = client.unwrap();
     // Query for device uuid and token (both used for auth)
     let query = "SELECT uuid, current_token FROM devices WHERE user_id = $1 AND device_id = $2";
-    let result = client.query(query, &[&user_id, &device_id.as_ref().unwrap().parse::<i32>().unwrap()]).await;
+    let result = client.query(query, &[&user_id, &device_id.parse::<i32>().unwrap()]).await;
 
     let rows = match result {
         Ok(ref rows) if !rows.is_empty() => rows,
@@ -74,16 +77,23 @@ async fn websocket_handler(
     let argon2 = Argon2::default();
     let parsed_uuid = password_hash::PasswordHash::new(&db_uuid)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if argon2.verify_password(uuid.unwrap().as_bytes(), &parsed_uuid).is_err() || token.unwrap() != db_token {
+
+    if argon2.verify_password(uuid.as_bytes(), &parsed_uuid).is_err() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    println!("UUID Check Passed");
+    println!("Token: {}, DB Token: {}", token, db_token);
 
+    if token != db_token {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    println!("Token Check Passed");
     // Delete the old device token and replace it with a new one
     // This is to prevent replay attacks and ensure the token is fresh
-    let new_token = generate_token().await
+    let new_token = authentication::generate_token().await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let _query = client.execute("UPDATE devices SET current_token = $1 WHERE user_id = $2 AND device_id = $3", &[&new_token, &user_id, &device_id.as_ref().unwrap().parse::<i32>().unwrap()])
+    let _query = client.execute("UPDATE devices SET current_token = $1 WHERE user_id = $2 AND device_id = $3", &[&new_token, &user_id, &device_id.parse::<i32>().unwrap()])
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -97,14 +107,21 @@ async fn handle_socket(socket: WebSocket, users: Users, user_id: String, device_
     let (tx, mut rx) = broadcast::channel::<String>(100);
 
     //send a confirmation message to the confirm successful connection
-    let confirmation_message = messages_outbound::confirmation(&user_id, &new_token).await?;
-    tx.send(confirmation_message.to_string()).unwrap();
+    let auth_message = messages_outbound::auth(&user_id, &new_token, &"confirm").await.unwrap();
+    tx.send(auth_message.to_string()).unwrap();
 
     //insert the user into the users map
     // This allows us to send messages to this user later
-    users.lock().await.insert(format!("{}:{}", user_id.clone(), device_id.clone()), tx.clone());
+    let device_id_int = match device_id.clone().parse::<i32>() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to parse device_id: {}", e);
+            return;
+        }
+    };
+    users.lock().await.insert(device_id_int, tx.clone());
 
-    // Spawn task to send messages to this client
+// Spawn task to send messages to this client
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             if sender.send(axum::extract::ws::Message::Text(msg.into())).await.is_err() {
@@ -115,9 +132,9 @@ async fn handle_socket(socket: WebSocket, users: Users, user_id: String, device_
 
     // Handle incoming messages
     //Create clones to allow an owned copy of each channel for each task
-    let tx_clone = tx.clone();
+    let _tx_clone = tx.clone();
     let users_clone = users.clone();
-    let user_id_clone = user_id.clone();
+    let device_id_clone = device_id_int.clone();
 
 
     //new message recieve task
@@ -130,17 +147,31 @@ async fn handle_socket(socket: WebSocket, users: Users, user_id: String, device_
                             match msg_type {
                                 "message" => {
                                     // Handle encrypted messages
+                                    println!("Received message: {}", text);
+
                                     if let (Some(content), Some(recipient)) = (
                                         json.get("content").and_then(|v| v.as_str()),
                                         json.get("recipient").and_then(|v| v.as_str())
                                     ) {
                                         // Forward encrypted message to recipient
                                         let users_lock = users_clone.lock().await;
+                                        
                                         // Check if recipient exists in the users map
-                                        if let Some(recipient_tx) = users_lock.get(recipient) {
-                                            let message = messages_outbound::message(&user_id_clone, content).await?;
-                                            let _ = recipient_tx.send(message.to_string());
+                                        if let Ok(recipient_i32) = recipient.parse()/*i32::try_from(recipient)*/ {
+                                            if let Some(recipient_tx) = users_lock.get(&recipient_i32) {
+                                                let message = messages_outbound::message(&device_id_clone.to_string(), content).await.unwrap();
+                                                println!("message: {}", message);
+                                                let _ = recipient_tx.send(message.to_string());
+                                            }
                                         }
+                                    }
+                                }
+                                "user" => {
+                                    // Handle user-related messages
+                                    if let Ok(response) = messages_inbound::handler(json).await {
+                                        let _ = _tx_clone.send(response.to_string());
+                                    } else {
+                                        eprintln!("Failed to handle user message");
                                     }
                                 }
                                 _ => {}
@@ -166,12 +197,12 @@ async fn handle_socket(socket: WebSocket, users: Users, user_id: String, device_
     }
 
     // Clean up user when they disconnect
-    users.lock().await.remove(&user_id);
-    println!("User {} disconnected", user_id);
+    users.lock().await.remove(&device_id_int);
+    println!("User {} disconnected", device_id_int);
 }
 
 async fn new_account(Json(payload): Json<Value>) -> Result<ResponseJson<Value>, StatusCode> { 
-    match new_account_logic(payload).await {
+    match account_creation::new_account_logic(payload).await {
         Ok(response) => Ok(ResponseJson(response)),
         Err(e) => Err(e),
     }    
@@ -183,89 +214,18 @@ Returning users will authenticate directly using a token at the /ws endpoint
 TL;DR: Use this function to register a new device and get a token
 */
 async fn authenticate(Json(payload): Json<Value>) -> Result<ResponseJson<Value>, StatusCode> {
-    match authenticate_logic(payload).await {
+    match authentication::authenticate_user_on_new_device(payload).await {
         Ok(response) => Ok(ResponseJson(response)),
         Err(e) => Err(e),
     }
 }
 
-async fn new_account_logic(data: Value) -> Result<Value, StatusCode> {
-    let client = db_connection().await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    //verify values
-    //username == user_id
-    let username = data.get("username").and_then(|v| v.as_str());
-    let password = data.get("password").and_then(|v| v.as_str());
-    let email = data.get("email").and_then(|v| v.as_str());
-    let uuid = data.get("uuid").and_then(|v| v.as_str());
-
-    if username.is_none() || password.is_none() || email.is_none() || uuid.is_none() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    //implement email verification here
-
-    // Hash the password
-    //Using less secure method temporarily due to errors in WSL
-    let hashed_password = hash_argon2(password.unwrap())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    //hash the uuid
-    let hashed_uuid = hash_argon2(uuid.unwrap())
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Insert user into database
-    let query = "INSERT INTO users (user_id, password_hash, email) VALUES ($1, $2, $3)";
-    let _result = client.execute(query, &[&username, &hashed_password.to_string(), &email])
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    //Get token for future auth from this device
-    let tok = generate_token().await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    println!("username: {}, uuid: {}, token: {}", username.unwrap(), hashed_uuid, tok);
-
-    //insert device into database
-    let query = "INSERT INTO devices (user_id, uuid, current_token) VALUES ($1, $2, $3)";
-    let _result =  match client.execute(query, &[&username, &hashed_uuid, &tok]).await {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Database insert error: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-
-    let query = "SELECT device_id from devices WHERE user_id = $1 AND uuid = $2";
-    let _result = match client.query(query, &[&username, &hashed_uuid]).await {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("Database query error: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    if _result.is_empty() {
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-    let row = &_result[0];
-    let device_id: i32 = row.get(0);
-    
-    Ok(serde_json::json!({
-        "status": "success",
-        "message": "Account created successfully",
-        "username": username.unwrap(),
-        "token": tok,
-        "device_id": device_id.to_string(),
-    }))
-}
 /*
 Logic to authenticate a user on a new device (using username and password)
 TODO: add email verification and verification using user trusted device
 */
-async fn authenticate_logic(data: Value) -> Result<Value, StatusCode> {
+/*async fn authenticate_logic(data: Value) -> Result<Value, StatusCode> {
     let client = db_connection().await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let username = data.get("username").and_then(|v| v.as_str());
@@ -299,11 +259,11 @@ async fn authenticate_logic(data: Value) -> Result<Value, StatusCode> {
     }
 
     // Hash the uuid
-    let hashed_uuid = hash_argon2(uuid.unwrap())
+    let hashed_uuid = authentication::hash_argon2(uuid.unwrap())
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let tok = generate_token().await
+    let tok = authentication::generate_token().await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let query = client.execute("INSERT INTO devices (user_id, device_uuid, current_token) VALUES ($1, $2, $3)", &[&username, &hashed_uuid, &tok])
@@ -325,21 +285,7 @@ async fn authenticate_logic(data: Value) -> Result<Value, StatusCode> {
         "token": tok,
         "device_id": device_id.to_string(),
     }))
-}
+}*/
 
-async fn generate_token() -> Result<String, Box<dyn std::error::Error>> {
-    let mut token_bytes = [0u8; 64];
-    getrandom::getrandom(&mut token_bytes)
-        .map_err(|e| format!("Failed to generate token: {}", e))?;
-    let token = base64::engine::general_purpose::STANDARD.encode(&token_bytes);
-    Ok(token)
-}
 
-async fn hash_argon2(password: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).map_err(|e| format!("Failed to generate salt: {}", e))?;
-    let salt = SaltString::encode_b64(&seed).map_err(|e| format!("Failed to encode salt: {}", e))?;
-    let argon2 = Argon2::default();
-    let hashed_password = argon2.hash_password(password.as_bytes(), &salt).map_err(|e| format!("Failed to hash password: {}", e))?;
-    Ok(hashed_password.to_string())
-}
+
